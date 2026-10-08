@@ -14,6 +14,23 @@ CUDA_VISIBLE_DEVICES=3 nohup python -u train_skip_stage2.py \
         > logs/train_stage2_nhhaze_skip_123_gate.log &
 
 
+CUDA_VISIBLE_DEVICES=2 nohup python -u train_skip_stage2.py \
+        --base_model black-forest-labs/FLUX.2-klein-4B \
+        --hazy_dir /data/storage/users/yliu/datasets/dehazing/NH-HAZE/train/hazy --gt_dir /data/storage/users/yliu/datasets/dehazing/NH-HAZE/train/gt \
+        --latent_dirs ./infer_out_0/latents ./infer_out_1/latents ./infer_out_2/latents ./infer_out_3/latents ./infer_out_4/latents ./infer_out_5/latents \
+        --train_ids 1-45 --val_ids 46-50 \
+        --skip_arch pyramid \
+        --skip_levels 0 1 2 3 \
+        --output_dir ./ckpt_pyr_0123 \
+        > logs/train_stage2_nhhaze_pyr_0123.log &
+
+
+# 新版
+python -u train_skip_stage2.py ... --skip_arch pyramid --skip_levels 0 1 2 3 --output_dir ./ckpt_pyr_0123
+# 对照：旧结构，同样从零训，同样的 steps 和 seed
+python -u train_skip_stage2.py ... --skip_arch perlevel --skip_type gated --skip_levels 0 1 2 3 --output_dir ./ckpt_perlevel_0123
+
+
 CUDA_VISIBLE_DEVICES=1 nohup python -u train_skip_stage2.py \
         --base_model black-forest-labs/FLUX.2-klein-4B \
         --hazy_dir /data/storage/users/yliu/datasets/RESIDE_Standard/ITS_train/hazy --gt_dir /data/storage/users/yliu/datasets/RESIDE_Standard/ITS_train/clear \
@@ -26,14 +43,12 @@ CUDA_VISIBLE_DEVICES=1 nohup python -u train_skip_stage2.py \
 CUDA_VISIBLE_DEVICES=3 nohup python -u train_skip_stage2.py \
         --base_model black-forest-labs/FLUX.2-klein-4B \
         --hazy_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/hazy --gt_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/gt \
-        --latent_dirs ./infer_out_densehaze_skip_0/latents ./infer_out_densehaze_skip_1/latents ./infer_out_densehaze_skip_2/latents ./infer_out_densehaze_skip_3/latents ./infer_out_densehaze_skip_4/latents ./infer_out_densehaze_skip_5/latents \
+        --latent_dirs ./infer_out_dense_0/latents ./infer_out_dense_1/latents ./infer_out_dense_2/latents ./infer_out_dense_3/latents ./infer_out_dense_4/latents ./infer_out_dense_5/latents \
         --train_ids 1-45 --val_ids 46-50 \
-        --skip_levels 1 2 3 \
-        --skip_type gated \
-        --gate_bias_init 0 \
-        --init_ckpt /home/yliu/code/vae-skip-experiment/checkpoints_stage2_densehaze/skip_stage2_best.pt \
-        --output_dir ./checkpoints_stage2_densehaze_skip_123_gate \
-        > logs/train_stage2_densehaze_skip_123_gate.log &
+        --skip_levels 0 1 2 3 \
+        --skip_arch pyramid \
+        --output_dir ./ckpt_pyr_densehaze_0123 \
+        > logs/train_stage2_densehaze_pyr_0123.log &
 
 """
 
@@ -54,6 +69,8 @@ from eval_infer import gt_candidates, index_dir, leading_int, original_region, p
 from infer_dehaze import preprocess_cond, vae_scale_factor_from_vae
 from skip_gated import (build_multi_skip, ckpt_levels, load_skip, patch_decoder_multi,
                         skip_kind_from_state_dict, to_multi_state_dict, unexpected_load_issues)
+from skip_pyramid import (build_pyramid_skip, is_pyramid_state_dict, load_skip_auto,
+                          patch_decoder_auto, pyramid_config_from_state_dict)
 from skimage.metrics import structural_similarity
 from ssim_decompose import ssim_decompose
 
@@ -353,6 +370,12 @@ def main():
                    help="在第几个up_block之后挂skip，可多个。Flux2 VAE共4个(0..3)：level 3=最后一个"
                         "(原来的位置)，level 2 输出256通道、全分辨率。0、1是1/4、1/2分辨率，不建议。"
                         "例：--skip_levels 2 3。--eval_only时以checkpoint为准")
+    p.add_argument("--skip_arch", default="perlevel", choices=["perlevel", "pyramid"],
+                   help="perlevel=原结构(每层各自 interpolate+两层卷积)；pyramid=共享多尺度像素编码器+门控融合"
+                        "(skip_pyramid.py，总是门控版，需要从零训练，不能用perlevel的checkpoint热启动)。"
+                        "--init_ckpt本身是pyramid时自动按pyramid处理")
+    p.add_argument("--pyr_widths", type=int, nargs=3, default=[64, 128, 128],
+                   help="仅pyramid新建时生效：金字塔 1/1、1/2、1/4 三级的通道数。数据很少(如NH-HAZE 45张)时可调小防过拟合")
     p.add_argument("--gate_bias_init", type=float, default=0.0,
                    help="仅gated且新建门控头时生效。从头训练用0(gate=0.5)；"
                         "从plain权重热启动建议3(gate≈0.95)，避免已训练好的修正量被门控减半")
@@ -401,19 +424,43 @@ def main():
     block_out_channels = list(vae.config.block_out_channels)
     final_level = len(block_out_channels) - 1
     if args.eval_only:
-        skip, desc = load_skip(args.init_ckpt, block_out_channels, dev)  # 按checkpoint严格加载
+        skip, desc = load_skip_auto(args.init_ckpt, block_out_channels, dev)  # 按checkpoint严格加载(perlevel/pyramid自动识别)
         skip_kind = "gated" if "gated" in desc else "plain"
         print(f"skip 结构(按checkpoint自动识别): {desc}")
     else:
         sd = to_multi_state_dict(torch.load(args.init_ckpt, map_location="cpu"), final_level) if args.init_ckpt else None
         skip_levels = sorted(set(args.skip_levels))
         skip_kind = args.skip_type
-        if sd is not None and skip_kind_from_state_dict(sd) == "gated":
-            if args.skip_type != "gated":
-                print(f"[提示] checkpoint 是 gated 版，忽略 --skip_type {args.skip_type}")
+        skip_arch = args.skip_arch
+        if sd is not None and is_pyramid_state_dict(sd):
+            skip_arch = "pyramid"
+        if skip_arch == "pyramid":
+            if sd is not None and not is_pyramid_state_dict(sd):
+                raise SystemExit("--skip_arch pyramid 不能用 perlevel 的 checkpoint 热启动(特征提取器不同，"
+                                 "旧 fuse_conv/gate_head 与新特征不对应)。去掉 --init_ckpt 从零训练，"
+                                 "或给一个 pyramid 的 checkpoint")
+            if sd is not None:  # 继续训练：结构完全按checkpoint
+                skip_levels, widths, gate_hidden = pyramid_config_from_state_dict(sd)
+                print(f"[提示] 按 pyramid checkpoint 恢复结构: levels={skip_levels}, widths={list(widths)}")
+            else:
+                widths, gate_hidden = tuple(args.pyr_widths), 32
             skip_kind = "gated"
-        skip = build_multi_skip(skip_kind, skip_levels, block_out_channels, gate_bias_init=args.gate_bias_init)
-        if sd is not None:
+            skip = build_pyramid_skip(skip_levels, block_out_channels, widths=widths, gate_hidden=gate_hidden,
+                                      gate_bias_init=args.gate_bias_init)
+            if sd is not None:
+                skip.load_state_dict(sd)  # 严格加载
+            n_enc = sum(p_.numel() for p_ in skip.encoder.parameters())
+            n_fus = sum(p_.numel() for p_ in skip.levels.parameters())
+            print(f"skip 结构: pyramid(widths={list(widths)}), levels={skip_levels}, "
+                  f"参数量 编码器={n_enc / 1e6:.2f}M 融合层={n_fus / 1e6:.2f}M")
+            skip.to(dev, torch.float32)
+        else:
+            if sd is not None and skip_kind_from_state_dict(sd) == "gated":
+                if args.skip_type != "gated":
+                    print(f"[提示] checkpoint 是 gated 版，忽略 --skip_type {args.skip_type}")
+                skip_kind = "gated"
+            skip = build_multi_skip(skip_kind, skip_levels, block_out_channels, gate_bias_init=args.gate_bias_init)
+        if skip_arch != "pyramid" and sd is not None:
             missing, unexpected = skip.load_state_dict(sd, strict=False)
             new_levels = sorted(set(skip_levels) - set(ckpt_levels(sd)))
             bad = unexpected_load_issues(missing, unexpected, new_levels)
@@ -427,7 +474,7 @@ def main():
         print(f"skip 结构: {skip_kind}, levels={skip_levels}")
         skip.to(dev, torch.float32)
     skip.eval() if args.eval_only else skip.train()
-    patch_decoder_multi(vae.decoder, skip)
+    patch_decoder_auto(vae.decoder, skip)  # perlevel -> patch_decoder_multi，pyramid -> patch_decoder_pyramid
     scale = vae_scale_factor_from_vae(vae)
     proc = Flux2ImageProcessor(vae_scale_factor=scale)
 

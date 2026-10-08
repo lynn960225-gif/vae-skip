@@ -60,6 +60,68 @@ done
 echo "PID: $!"
 
 """
+"""
+infer_dehaze.py
+
+
+CUDA_VISIBLE_DEVICES=0  python infer_dehaze.py \
+        --base_model black-forest-labs/FLUX.2-klein-4B \
+        --lora /data/storage/users/yliu/outputs/flux2-i2i-densehaze-4b-merge/checkpoint-3000 --lora_weight_name pytorch_lora_weights.safetensors \
+        --skip_ckpt /home/yliu/code/vae-skip-experiment/checkpoints_hazy_cond/skip_fusion_final.pt \
+        --hazy_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/hazy --out_dir ./infer_out_dense_check \
+        --gt_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/gt \
+        --prompt "remove haze, restore clear visibility" --steps 4 --seed 5 --save_latents
+
+
+CUDA_VISIBLE_DEVICES=5  python infer_dehaze.py \
+        --base_model black-forest-labs/FLUX.2-klein-4B \
+        --lora /data/storage/users/yliu/outputs/flux2-i2i-densehaze-4b-merge/checkpoint-3000 --lora_weight_name pytorch_lora_weights.safetensors \
+        --skip_ckpt /home/yliu/code/vae-skip-experiment/checkpoints_stage2_its/skip_stage2_best.pt \
+        --hazy_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/hazy --out_dir ./infer_out_dense_test \
+        --gt_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/gt \
+        --prompt "remove haze, restore clear visibility" --steps 4 --seed 5 --save_latents
+
+nohup bash -c '
+for seed in 0 1 2 3 4 5; do
+  CUDA_VISIBLE_DEVICES=0 python -u infer_dehaze.py \
+      --base_model black-forest-labs/FLUX.2-klein-4B \
+      --lora /data/storage/users/yliu/outputs/flux2-i2i-its-cos/checkpoint-3000 --lora_weight_name pytorch_lora_weights.safetensors \
+      --skip_ckpt /home/yliu/code/vae-skip-experiment/checkpoints_hazy_cond/skip_fusion_final.pt \
+      --hazy_dir /data/storage/users/yliu/datasets/RESIDE_Standard/ITS_train/hazy --out_dir ./infer_out_its_0 \
+      --gt_dir /data/storage/users/yliu/datasets/RESIDE_Standard/ITS_train/clear \
+      --prompt "remove haze, restore clear visibility" --steps 4 --seed 0 --save_latents
+done
+' > logs/infer_its_multiseed_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+echo "PID: $!"
+
+
+nohup bash -c '
+for seed in 0 1 2 3 4 5; do
+  CUDA_VISIBLE_DEVICES=2 python -u infer_dehaze.py \
+      --base_model black-forest-labs/FLUX.2-klein-4B \
+      --lora /data/storage/users/yliu/outputs/flux2-i2i-nhhaze-4b-skip/checkpoint-2900 --lora_weight_name pytorch_lora_weights.safetensors \
+      --skip_ckpt /home/yliu/code/vae-skip-experiment/checkpoints_stage2_nhhaze/skip_stage2_best.pt \
+      --hazy_dir /data/storage/users/yliu/datasets/dehazing/NH-HAZE/train/hazy --out_dir ./infer_out_nhhaze_skip_$seed \
+      --gt_dir /data/storage/users/yliu/datasets/dehazing/NH-HAZE/train/gt \
+      --prompt "remove haze, restore clear visibility" --steps 4 --seed $seed --save_latents
+done
+' > logs/infer_nhhaze_skip_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+echo "PID: $!"
+
+nohup bash -c '
+for seed in 0 1 2 3 4 5; do
+  CUDA_VISIBLE_DEVICES=2 python -u infer_dehaze.py \
+      --base_model black-forest-labs/FLUX.2-klein-4B \
+      --lora /data/storage/users/yliu/outputs/flux2-i2i-densehaze-4b-skip-ssim/checkpoint-3000 --lora_weight_name pytorch_lora_weights.safetensors \
+      --skip_ckpt /home/yliu/code/vae-skip-experiment/checkpoints_stage2_densehaze/skip_stage2_best.pt \
+      --hazy_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/hazy --out_dir ./infer_out_densehaze_skip_$seed \
+      --gt_dir /data/storage/users/yliu/datasets/dehazing/Dense_Haze/train/gt \
+      --prompt "remove haze, restore clear visibility" --steps 4 --seed $seed --save_latents
+done
+' > logs/infer_densehaze_skip_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+echo "PID: $!"
+
+"""
 
 import argparse
 import glob
@@ -72,7 +134,8 @@ from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 from eval_infer import gt_candidates, index_dir, make_gt_aligner, original_region
-from skip_gated import load_skip, patch_decoder_multi
+from skip_pyramid import load_skip_auto, patch_decoder_auto  # 同时支持旧版 per-level 和 pyramid 的 checkpoint
+from traj_guidance import attach_trajectory_guidance, load_traj
 
 try:
     from ssim_decompose import ssim_decompose
@@ -90,9 +153,15 @@ def load_pipe(args):
 
     # VAE(含skip)全程fp32：bf16的舍入误差量级足以吃掉 41->45 dB 这种差异
     pipe.vae.to(torch.float32)
-    skip, desc = load_skip(args.skip_ckpt, list(pipe.vae.config.block_out_channels), args.device)
+    skip, desc = load_skip_auto(args.skip_ckpt, list(pipe.vae.config.block_out_channels), args.device)
     print(f"skip 结构(按checkpoint自动识别): {desc}")
-    patch_decoder_multi(pipe.vae.decoder, skip)
+    patch_decoder_auto(pipe.vae.decoder, skip)
+
+    # 轨迹侧像素引导(可选)：必须与训练该 LoRA 时是同一个 traj_guidance.pt，否则条件分布对不上
+    if getattr(args, "traj_ckpt", None):
+        traj = load_traj(args.traj_ckpt, args.device)
+        attach_trajectory_guidance(pipe, traj)
+        print(f"已挂载轨迹侧像素引导: {args.traj_ckpt}  config={traj.config}")
     return pipe
 
 
@@ -197,6 +266,8 @@ def main():
     p.add_argument("--lora", default=None)
     p.add_argument("--lora_weight_name", default=None)
     p.add_argument("--skip_ckpt", required=True)
+    p.add_argument("--traj_ckpt", default=None,
+                   help="训练时用 --traj_guidance 得到的 traj_guidance.pt（与该 LoRA 配套）；不给则不启用轨迹侧像素引导")
     p.add_argument("--hazy_dir", required=True)
     p.add_argument("--out_dir", required=True)
     p.add_argument("--prompt", required=True, help="与训练LoRA时一致的prompt")
